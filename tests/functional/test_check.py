@@ -363,3 +363,120 @@ def test_check_unsupported(
     result = script.pip("check", expect_error=True)
     assert "base 0.1.0 is not supported on this platform" in result.stdout
     assert result.returncode == 1
+
+
+def test_check_explain_transitive_conflict(script: PipTestEnvironment) -> None:
+    pkga_path = create_test_package_with_setup(
+        script,
+        name="pkga",
+        version="1.0",
+        install_requires=["middle"],
+    )
+    middle_path = create_test_package_with_setup(
+        script,
+        name="middle",
+        version="0.9",
+        install_requires=["broken>=1.0"],
+    )
+    broken_path = create_test_package_with_setup(
+        script,
+        name="broken",
+        version="0.1",
+    )
+    for path in (pkga_path, middle_path):
+        script.pip("install", "--no-build-isolation", "--no-index", path, "--no-deps")
+    script.pip(
+        "install",
+        "--no-build-isolation",
+        "--no-index",
+        broken_path,
+        "--no-deps",
+        "--no-warn-conflicts",
+    )
+
+    result = script.pip("check", "--explain", "pkga", expect_error=True)
+
+    assert (
+        "broken 0.1 does not satisfy broken>=1.0, required on these paths "
+        "from pkga 1.0:"
+    ) in result.stdout
+    assert "  pkga 1.0" in result.stdout
+    assert "    -> middle 0.9  [middle]" in result.stdout
+    assert "    -> broken 0.1  [broken>=1.0]" in result.stdout
+    # The plain conflict one-liner is replaced by the explanation.
+    assert "pkga 1.0 has requirement" not in result.stdout
+    assert result.returncode == 1
+
+
+def test_check_explain_clean(script: PipTestEnvironment) -> None:
+    pkga_path = create_test_package_with_setup(
+        script,
+        name="pkga",
+        version="1.0",
+        install_requires=["working"],
+    )
+    working_path = create_test_package_with_setup(
+        script,
+        name="working",
+        version="1.0",
+    )
+    script.pip("install", "--no-build-isolation", "--no-index", pkga_path, "--no-deps")
+    script.pip(
+        "install", "--no-build-isolation", "--no-index", working_path, "--no-deps"
+    )
+
+    result = script.pip("check", "--explain", "pkga")
+    assert "No conflicting dependency paths found from pkga 1.0." in result.stdout
+    assert "No broken requirements found." in result.stdout
+    assert result.returncode == 0
+
+
+def test_check_explain_with_user_selected_extra(
+    script: PipTestEnvironment,
+) -> None:
+    pkga_path = create_test_package_with_setup(
+        script,
+        name="pkga",
+        version="1.0",
+        extras_require={"x": ["broken>=1.0"]},
+    )
+    broken_path = create_test_package_with_setup(
+        script,
+        name="broken",
+        version="0.1",
+    )
+    script.pip("install", "--no-build-isolation", "--no-index", pkga_path, "--no-deps")
+    script.pip(
+        "install",
+        "--no-build-isolation",
+        "--no-index",
+        broken_path,
+        "--no-deps",
+        "--no-warn-conflicts",
+    )
+
+    # The extra-gated dependency is not an effective requirement unless the
+    # user explicitly selects the extra. Plain check still reports the
+    # marker-gated requirement, hence expect_error.
+    result = script.pip("check", "--explain", "pkga", expect_error=True)
+    assert "No conflicting dependency paths found from pkga 1.0." in result.stdout
+
+    result = script.pip("check", "--explain", "pkga[x]", expect_error=True)
+    assert "required on these paths from pkga[x] 1.0:" in result.stdout
+    # setuptools quote style varies between versions; packaging preserves the
+    # quoting used in the metadata.
+    normalized_stdout = result.stdout.replace("'", '"')
+    assert '-> broken 0.1  [broken>=1.0; extra == "x"]' in normalized_stdout
+    assert result.returncode == 1
+
+
+def test_check_explain_not_installed(script: PipTestEnvironment) -> None:
+    result = script.pip("check", "--explain", "missing-project", expect_error=True)
+    assert "package is not installed" in result.stderr
+    assert result.returncode == 1
+
+
+def test_check_explain_invalid_value(script: PipTestEnvironment) -> None:
+    result = script.pip("check", "--explain", "pkga==1.0", expect_error=True)
+    assert "project name with optional extras" in result.stderr
+    assert result.returncode == 1

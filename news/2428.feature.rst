@@ -1,0 +1,7 @@
+Add ``pip check --explain PROJECT`` to print bounded, effective dependency
+paths from an installed top-level project (with optional user-selected
+extras, e.g. ``project[extra]``) to packages whose installed versions
+conflict with its dependencies. Each path edge preserves its version
+specifier, environment marker and requested extras; distinct constraints are
+listed separately, and the path search is bounded so dependency cycles
+cannot cause infinite expansion.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections import deque
 from collections.abc import Callable, Generator, Iterable
 from contextlib import suppress
 from email.parser import Parser
@@ -38,6 +39,49 @@ MissingDict = dict[NormalizedName, list[Missing]]
 ConflictingDict = dict[NormalizedName, list[Conflicting]]
 CheckResult = tuple[MissingDict, ConflictingDict]
 ConflictDetails = tuple[PackageSet, CheckResult]
+
+# Bounds for the bounded dependency path explanation used by
+# ``pip check --explain``.
+MAX_EXPLAIN_DEPTH = 10
+MAX_EXPLAIN_PATHS_PER_REQUIREMENT = 20
+
+
+class DependencyEdge(NamedTuple):
+    """An effective dependency edge: the requirement declared by the source.
+
+    ``str(requirement)`` preserves the version specifier, environment marker
+    and the extras requested on the target.
+    """
+
+    requirement: Requirement
+    target: NormalizedName
+
+
+class ConflictPath(NamedTuple):
+    """A simple path from the requested top-level project to a conflict.
+
+    ``len(nodes) == len(edges) + 1``; edge *i* goes from ``nodes[i]`` to
+    ``nodes[i + 1]`` and is labelled by ``edges[i].requirement``.
+    """
+
+    nodes: tuple[NormalizedName, ...]
+    edges: tuple[DependencyEdge, ...]
+
+
+class RequirementPaths(NamedTuple):
+    """Paths ending with one particular violated requirement constraint."""
+
+    requirement: Requirement
+    paths: list[ConflictPath]
+    truncated: bool
+
+
+class ConflictExplanation(NamedTuple):
+    """Violated constraints on one installed package, grouped separately."""
+
+    target: NormalizedName
+    target_version: Version
+    requirement_paths: list[RequirementPaths]
 
 
 def create_package_set_from_installed() -> tuple[PackageSet, bool]:
@@ -172,3 +216,196 @@ def _create_whitelist(
                 break
 
     return packages_affected
+
+
+def _requirement_is_active(
+    req: Requirement, active_extras: set[NormalizedName]
+) -> bool:
+    """Whether a dependency requirement is effective for the current env.
+
+    Markers are evaluated against the running interpreter (like the rest of
+    ``pip check``) for each selected extra. The empty extra is always
+    considered, since selecting an extra never deactivates unconditional
+    dependencies.
+    """
+    if req.marker is None:
+        return True
+    contexts = ("", *sorted(active_extras))
+    return any(req.marker.evaluate({"extra": extra}) for extra in contexts)
+
+
+def _compute_effective_graph(
+    package_set: PackageSet,
+    root: NormalizedName,
+    root_extras: set[NormalizedName],
+) -> dict[NormalizedName, list[DependencyEdge]]:
+    """Effective installed dependency edges reachable from ``root``.
+
+    The extras selected on a package (the root's user-selected extras, or the
+    extras requested on an incoming edge) activate its extra-gated
+    dependencies. Extras propagate along edges via a monotonic fixpoint:
+    active-extra sets only grow and are finite, so dependency cycles cannot
+    cause unbounded expansion.
+
+    Edges pointing at missing distributions are not traversable and omitted;
+    version conflicts only concern installed packages.
+    """
+    active_extras: dict[NormalizedName, set[NormalizedName]] = {
+        root: set(root_extras)
+    }
+    adjacency: dict[NormalizedName, list[DependencyEdge]] = {}
+    seen_edges: dict[NormalizedName, set[str]] = {}
+    queue: deque[NormalizedName] = deque([root])
+
+    while queue:
+        source = queue.popleft()
+        edges = adjacency.setdefault(source, [])
+        edges_seen = seen_edges.setdefault(source, set())
+        for req in package_set[source].dependencies:
+            if not _requirement_is_active(req, active_extras.get(source, set())):
+                continue
+            target = canonicalize_name(req.name)
+            if target not in package_set:
+                continue
+            # Distinct requirements (different specifiers/markers/extras) are
+            # kept as distinct edges; identical duplicates collapse.
+            requirement_string = str(req)
+            if requirement_string in edges_seen:
+                continue
+            edges_seen.add(requirement_string)
+            edges.append(DependencyEdge(req, target))
+
+            requested_extras = {
+                canonicalize_name(extra) for extra in req.extras
+            }
+            if target not in active_extras:
+                # First effective edge reaching the node: expand it.
+                active_extras[target] = set(requested_extras)
+                queue.append(target)
+            else:
+                target_extras = active_extras[target]
+                if not requested_extras <= target_extras:
+                    target_extras.update(requested_extras)
+                    queue.append(target)
+
+    for edges in adjacency.values():
+        edges.sort(key=lambda edge: str(edge.requirement))
+    return adjacency
+
+
+def _find_conflict_paths(
+    adjacency: dict[NormalizedName, list[DependencyEdge]],
+    root: NormalizedName,
+    target: NormalizedName,
+    requirement: Requirement,
+) -> tuple[list[ConflictPath], bool]:
+    """Enumerate bounded simple paths from ``root`` to ``target``.
+
+    Only paths whose final edge declares ``requirement`` are returned. Cycles
+    cannot be entered (a node already on the path is not expanded), and the
+    search is bounded by ``MAX_EXPLAIN_DEPTH`` and
+    ``MAX_EXPLAIN_PATHS_PER_REQUIREMENT``. The second return value tells
+    whether the bounds cut off further results.
+    """
+    paths: list[ConflictPath] = []
+    truncated = False
+    requirement_string = str(requirement)
+
+    def dfs(
+        node: NormalizedName,
+        nodes: list[NormalizedName],
+        edges: list[DependencyEdge],
+        visited: set[NormalizedName],
+    ) -> bool:
+        nonlocal truncated
+
+        if edges and node == target:
+            if str(edges[-1].requirement) == requirement_string:
+                paths.append(ConflictPath(tuple(nodes), tuple(edges)))
+                if len(paths) >= MAX_EXPLAIN_PATHS_PER_REQUIREMENT:
+                    truncated = True
+                    return False
+            # The target is an endpoint; simple paths cannot reach it again.
+            return True
+
+        if len(edges) >= MAX_EXPLAIN_DEPTH:
+            truncated = True
+            return True
+
+        for edge in adjacency.get(node, []):
+            if edge.target in visited:
+                continue
+            nodes.append(edge.target)
+            edges.append(edge)
+            visited.add(edge.target)
+            should_continue = dfs(edge.target, nodes, edges, visited)
+            visited.remove(edge.target)
+            edges.pop()
+            nodes.pop()
+            if not should_continue:
+                return False
+        return True
+
+    dfs(root, [root], [], {root})
+
+    paths.sort(
+        key=lambda path: (
+            path.nodes,
+            tuple(str(edge.requirement) for edge in path.edges),
+        )
+    )
+    return paths, truncated
+
+
+def explain_conflict_paths(
+    package_set: PackageSet,
+    root: NormalizedName,
+    root_extras: set[NormalizedName],
+) -> list[ConflictExplanation] | None:
+    """Explain which effective paths from ``root`` require conflicted packages.
+
+    Returns ``None`` if ``root`` is not installed. Conflicting constraints
+    proposed by different sources (or differing in specifier/marker/extras)
+    appear as separate requirement groups, each with the paths that carry it.
+    """
+    if root not in package_set:
+        return None
+
+    adjacency = _compute_effective_graph(package_set, root, root_extras)
+
+    # target -> requirement string -> Requirement: each violated constraint
+    # gets its own group.
+    violated: dict[NormalizedName, dict[str, Requirement]] = {}
+    for edges in adjacency.values():
+        for edge in edges:
+            target = edge.target
+            if edge.requirement.specifier.contains(
+                package_set[target].version, prereleases=True
+            ):
+                continue
+            violated.setdefault(target, {})[str(edge.requirement)] = (
+                edge.requirement
+            )
+
+    explanations: list[ConflictExplanation] = []
+    for target in sorted(violated):
+        requirement_paths: list[RequirementPaths] = []
+        for requirement_string in sorted(violated[target]):
+            requirement = violated[target][requirement_string]
+            paths, truncated = _find_conflict_paths(
+                adjacency, root, target, requirement
+            )
+            if paths:
+                requirement_paths.append(
+                    RequirementPaths(requirement, paths, truncated)
+                )
+        if requirement_paths:
+            explanations.append(
+                ConflictExplanation(
+                    target,
+                    package_set[target].version,
+                    requirement_paths,
+                )
+            )
+
+    return explanations
